@@ -1,0 +1,14 @@
+README.md
+setup.py
+src/WOSAC/__init__.py
+src/WOSAC.egg-info/PKG-INFO
+src/WOSAC.egg-info/SOURCES.txt
+src/WOSAC.egg-info/dependency_links.txt
+src/WOSAC.egg-info/top_level.txt
+src/WOSAC/components/__init__.py
+src/WOSAC/config/__init__.py
+src/WOSAC/config/configuration.py
+src/WOSAC/constants/__init__.py
+src/WOSAC/entity/__init__.py
+src/WOSAC/pipeline/__init__.py
+src/WOSAC/utils/__init__.py

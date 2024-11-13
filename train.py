@@ -2,179 +2,123 @@ import os
 import argparse
 import torch
 from torch.optim import Adam
-from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import numpy as np
 from tqdm import tqdm
+from model.multipathpp import MultiPathPP
+from model.data import get_dataloader
+from model.losses import get_model_loss
+from utils.utils import set_random_seed, get_last_file, dict_to_cuda, get_yaml_config, mask_by_valid
+from model.normlization import normalize
 
-from simpleNNWOSAC import SimpleNNWOSAC
-
-class TrajectoryDataset(Dataset):
-    def __init__(self, data_path, history_size=10, future_size=5):
-        """
-        Simple dataset that loads trajectory data from numpy files.
-        Expects files with shape [n_samples, timesteps, 2]
-        """
-        self.data = np.load(data_path)
-        self.history_size = history_size
-        self.future_size = future_size
-        
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        trajectory = self.data[idx]
-        history = trajectory[:self.history_size].reshape(-1)
-        future = trajectory[self.history_size:self.history_size + self.future_size].reshape(-1)
-        return {
-            'history': torch.FloatTensor(history),
-            'future': torch.FloatTensor(future)
-        }
 
 def train(args):
-    # Create save directory if it doesn't exist
-    if not os.path.exists(args.save_folder):
-        os.makedirs(args.save_folder)
-    
-    # Initialize model, optimizer, and loss function
-    model = SimpleNNWOSAC(
-        history_size=args.history_size,
-        hidden_size=args.hidden_size,
-        future_size=args.future_size
-    )
-    
-    if torch.cuda.is_available():
-        model = model.cuda()
-        print("Using GPU")
-    
-    optimizer = Adam(model.parameters(), lr=args.learning_rate)
-    criterion = torch.nn.MSELoss()
-    
-    # Load the last checkpoint if it exists
-    last_checkpoint_path = os.path.join(args.save_folder, 'last_checkpoint.pth')
-    if os.path.exists(last_checkpoint_path):
-        checkpoint = torch.load(last_checkpoint_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        print(f"Resuming from epoch {start_epoch}")
-    else:
-        start_epoch = 0
-    
-    # Load data
-    train_dataset = TrajectoryDataset(
-        args.train_data_path,
-        history_size=args.history_size,
-        future_size=args.future_size
-    )
-    val_dataset = TrajectoryDataset(
-        args.val_data_path,
-        history_size=args.history_size,
-        future_size=args.future_size
-    )
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=4
-    )
-    
-    # Training loop
-    best_val_loss = float('inf')
-    for epoch in range(start_epoch, args.n_epochs):
-        # Training phase
-        model.train()
-        train_losses = []
-        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.n_epochs}')
-        
-        for batch in pbar:
-            history = batch['history']
-            future = batch['future']
-            
-            if torch.cuda.is_available():
-                history = history.cuda()
-                future = future.cuda()
-            
-            # Forward pass
+    # config
+    set_random_seed(42)
+    config = get_yaml_config(args.config)
+
+    # dataloader
+    dataloader = get_dataloader(args.train_data_path, config["train"]["data_config"])
+    val_dataloader = get_dataloader(args.val_data_path, config["val"]["data_config"])
+
+    # model init
+    loss_func = get_model_loss(config["model"]["loss"])
+    if(not os.path.exists(args.save_folder)):
+        os.mkdir(args.save_folder)
+    last_checkpoint = get_last_file(args.save_folder)
+    model = MultiPathPP(config["model"])
+    model.cuda()
+    optimizer = Adam(model.parameters(), **config["train"]["optimizer"])
+    if config["train"]["scheduler"]:
+        scheduler = ReduceLROnPlateau(optimizer, patience=20, factor=0.5, verbose=True)
+    num_steps = 0
+    if last_checkpoint is not None:
+        model.load_state_dict(torch.load(last_checkpoint)["model_state_dict"])
+        optimizer.load_state_dict(torch.load(last_checkpoint)["optimizer_state_dict"])
+        num_steps = torch.load(last_checkpoint)["num_steps"]
+        if config["train"]["scheduler"]:
+            scheduler.load_state_dict(torch.load(last_checkpoint)["scheduler_state_dict"])
+        print("LOADED ", last_checkpoint)
+    model_parameters = filter(lambda p: p.requires_grad, model.parameters())
+    params = sum([np.prod(p.size()) for p in model_parameters])
+    print("N PARAMS=", params)
+
+    # train and validation
+    best_loss = float('inf')
+    for epoch in tqdm(range(config["train"]["n_epochs"])):
+        pbar = tqdm(dataloader)
+        for data in pbar:
+            # train
+            model.train()
             optimizer.zero_grad()
-            predictions = model(history)
-            
-            # Compute loss and backward pass
-            loss = criterion(predictions, future)
+            if config["train"]["data_config"]["dataset_config"]["normlization"]:
+                data = normalize(data)
+            dict_to_cuda(data)
+            probas, coordinates, yaws = model(data, num_steps)
+
+            # loss and optimizer
+            gt_xy = data["future/xy"] - data["history/xy"][:, :, -1:, :]
+            gt_yaw = data["future/yaw"] - data["history/yaw"][:, :, -1:, :]
+            gt_valid = mask_by_valid(data["future/valid"], data["agent_valid"])
+            distance_loss, yaw_loss, confidence_loss = loss_func(
+                gt_xy, gt_valid, gt_yaw, probas, coordinates, yaws)
+            loss = distance_loss + yaw_loss + confidence_loss
             loss.backward()
-            
-            # Gradient clipping
-            if args.clip_grad_norm:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
-            
+
+            if "clip_grad_norm" in config["train"]:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config["train"]["clip_grad_norm"])
             optimizer.step()
-            train_losses.append(loss.item())
-            
-            # Update progress bar
-            pbar.set_description(
-                f'Epoch {epoch+1}/{args.n_epochs} - Loss: {loss.item():.4f}'
-            )
-        
-        # Save checkpoint after each epoch
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': np.mean(train_losses),
-        }, last_checkpoint_path)
-        
-        # Validation phase
-        if epoch % args.validate_every == 0:
-            model.eval()
-            val_losses = []
-            
-            with torch.no_grad():
-                for batch in tqdm(val_loader, desc='Validation'):
-                    history = batch['history']
-                    future = batch['future']
-                    
-                    if torch.cuda.is_available():
-                        history = history.cuda()
-                        future = future.cuda()
-                    
-                    predictions = model(history)
-                    loss = criterion(predictions, future)
-                    val_losses.append(loss.item())
-            
-            avg_val_loss = np.mean(val_losses)
-            print(f'Validation Loss: {avg_val_loss:.4f}')
-            
-            # Save best model
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': best_val_loss,
-                }, os.path.join(args.save_folder, 'best_model.pth'))
+
+            # log
+            if num_steps % 1 == 0:
+                pbar.set_description(f"epoch={epoch} loss={round(loss.item(), 2)} distance_loss={round(distance_loss.item(), 2)} yaw_loss={round(yaw_loss.item(), 2)} confidence_loss={round(confidence_loss.item(), 2)}")
+            # validation
+            if num_steps % config["train"]["validate_every_n_steps"] == 0 and num_steps > 0:
+                del data
+                torch.cuda.empty_cache()
+                model.eval()
+                with torch.no_grad():
+                    losses = []
+                    for data in tqdm(val_dataloader):
+                        if config["val"]["data_config"]["dataset_config"]["normlization"]:
+                            data = normalize(data)
+                        dict_to_cuda(data)
+                        probas, coordinates, yaws = model(data, num_steps)
+                        gt_xy = data["future/xy"] - data["history/xy"][:, :, -1:, :]
+                        gt_yaw = data["future/yaw"] - data["history/yaw"][:, :, -1:, :]
+                        gt_valid = mask_by_valid(data["future/valid"], data["agent_valid"])
+                        distance_loss, yaw_loss, confidence_loss = loss_func(
+                            gt_xy, gt_valid, gt_yaw, probas, coordinates, yaws)
+                        loss = distance_loss + yaw_loss + confidence_loss
+                        losses.append(loss.item())
+                    pbar.set_description(f"validation loss = {round(sum(losses) / len(losses), 2)}")
+
+                if sum(losses) / len(losses) < best_loss:
+                    best_loss = sum(losses) / len(losses)
+                    saving_data = {
+                        "num_steps": num_steps,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                    }
+                    if config["train"]["scheduler"]:
+                        saving_data["scheduler_state_dict"] = scheduler.state_dict()
+                    torch.save(saving_data, os.path.join(args.save_folder, f"best_{epoch}.pth"))
+
+            num_steps += 1
+            if "max_iterations" in config["train"] and num_steps > config["train"]["max_iterations"]:
+                break
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--train_data_path', type=str, required=True)
-    parser.add_argument('--val_data_path', type=str, required=True)
-    parser.add_argument('--save_folder', type=str, required=True)
-    parser.add_argument('--history_size', type=int, default=10)
-    parser.add_argument('--future_size', type=int, default=5)
-    parser.add_argument('--hidden_size', type=int, default=64)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--n_epochs', type=int, default=100)
-    parser.add_argument('--learning_rate', type=float, default=0.001)
-    parser.add_argument('--clip_grad_norm', type=float, default=None)
-    parser.add_argument('--validate_every', type=int, default=1)
-    return parser.parse_args()
+    parser.add_argument("--train_data_path", type=str, required=True)
+    parser.add_argument("--val_data_path", type=str, required=True)
+    parser.add_argument("--config", type=str, required=False, default="configs/Multipathpp.yaml", help="Vectorizer Config")
+    parser.add_argument("--save_folder", type=str, required=True, help="Save folder")
+    args = parser.parse_args()
+    return args
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     args = parse_arguments()
     train(args)
